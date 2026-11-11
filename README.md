@@ -96,8 +96,8 @@ the driver's reading path in the image.
 The rest of each image is the runtime, the compiler's support library and
 tables.  The driver's own code allocates nothing: every buffer is a
 fixed-size `Vec` in the caller's frame, and `AccelMilliG`, `TempMilliC` and
-`TapConfig` are `@value` structs.  The 496 provable arena bytes are the
-init-time allocations of the board handles, not of the driver.
+`TapConfig` are `@value` structs.  "Arena provable" is the compiler's count of
+allocations at initialisation.
 
 ### The effects
 
