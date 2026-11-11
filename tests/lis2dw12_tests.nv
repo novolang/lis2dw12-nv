@@ -1,0 +1,1715 @@
+// lis2dw12_tests — the driver over a double of the part: a register file
+// that answers on an I2C bus and on an SPI bus the way ST's data sheet
+// (DS11811 Rev 8, §§ 6.1 and 6.2) says a LIS2DW12 does, so the sub-address
+// and the command byte, the increment, the conversions, the FIFO, the
+// conversion on demand, the self-test and the bring-up are checked on the
+// host, one transaction at a time.  The log keeps what the controller sent,
+// in a form the tests compare.
+//
+// Log entries: an I2C write is 1, the address, the bytes sent, -1; an I2C
+// read is 2, the address, the sub-address, the count, -1; an SPI
+// transaction is 3, the bytes the controller clocked out, -1.  The writes
+// that reach a register are also kept apart, as the register and the byte,
+// so a bring-up is compared without the reads between its writes.
+
+use std.test
+use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, TimerAsync, AsyncEdge }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_thermo.{ TempMilliC, Thermometer }
+use dev_id.{ DeviceId, Identifiable }
+use lis2dw12
+use lis2dw12.{ Lis2dw12, Lis2dw12Spi, Lis2dwMode, Lis2dw12Port, TapConfig }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's registers.  `st` is the double's state:
+// 0 is 0 before an SPI command byte and 1 after it, 1 the register, 2 RW,
+// 5 1 when the part heard the transaction, 4 1 when a part is there, 9 1 inside an SPI transaction, 10 the number of
+// FIFO samples taken, 20 and 21 the SPI clock and mode, 22 the I2C clock,
+// 30 to 32 the digits the self-test adds to X, Y and Z, 40 the reads of
+// CTRL2 left before a self-clearing bit clears, 41 how many reads that is
+// (-1 for never), 42 the self-clearing bits pending, 50 the reads of STATUS
+// left that answer 0, 61 how many reads of CTRL3 a conversion on demand
+// takes (-1 for never), 62 the reads left, 63 1 while a conversion runs, 70
+// the transactions the part answers before it goes silent (0 for no
+// limit), 71 the transactions used, 80 the writes kept, 98 the bytes in
+// the FIFO and 99 the entries in the log.  `ro` lists registers that
+// ignore a write.  `fifo` holds the FIFO's samples as six bytes each, `log`
+// the log and `wl` the writes.
+
+struct Chip
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+    ro: HashMap<Int, Int>
+    log: HashMap<Int, Int>
+    fifo: HashMap<Int, Int>
+    wl: HashMap<Int, Int>
+
+@tier(app)
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+// The chip with WHO_AM_I and the reset values in place.
+@tier(app)
+fn chip() -> Chip
+    let c = Chip { regs: HashMap.new(),
+        st: HashMap.new(),
+        ro: HashMap.new(),
+        log: HashMap.new(),
+        fifo: HashMap.new(),
+        wl: HashMap.new() }
+    c.regs.insert(0x0F, 0x44)
+    c.regs.insert(0x21, 0x04)
+    c.st.insert(4, 1)
+    c
+
+// Appends a value to the log.
+@tier(app)
+fn log_push(c: Chip, v: Int)
+    let n = at(c.st, 99)
+    c.log.insert(n, v)
+    c.st.insert(99, n + 1)
+
+// Empties the log.
+@tier(app)
+fn log_clear(c: Chip)
+    c.st.insert(99, 0)
+
+// Whether the part answers this transaction: it is there, and it has not
+// used the transactions it was allowed.
+@tier(app)
+fn present(c: Chip) -> Bool
+    if at(c.st, 4) == 0
+        return false
+    let lim = at(c.st, 70)
+    if lim == 0
+        return true
+    let used = at(c.st, 71) + 1
+    c.st.insert(71, used)
+    used <= lim
+
+// The self-test's change to the 16-bit word of axis `axis` (0 X, 1 Y,
+// 2 Z): ST 01 adds the part's digits, left-justified in 14 bits, ST 10
+// subtracts them.
+@tier(app)
+fn st_counts(c: Chip, axis: Int) -> Int
+    let st_bits = (at(c.regs, 0x22) >> 6) & 3
+    let amount = at(c.st, 30 + axis)
+    if st_bits == 1
+        return amount * 4
+    if st_bits == 2
+        return 0 - amount * 4
+    0
+
+// The FIFO_SAMPLES the part would read: the count, 32 reading as 0x20.
+@tier(app)
+fn fifo_diff(c: Chip) -> Int
+    let n = at(c.st, 98) / 6 - at(c.st, 10)
+    if n <= 0
+        return 0
+    if n >= 32
+        return 32
+    n
+
+// Whether the FIFO is in a mode other than bypass.
+@tier(app)
+fn fifo_on(c: Chip) -> Bool
+    (at(c.regs, 0x2E) >> 5) != 0
+
+// Moves the oldest FIFO sample into the output registers.
+@tier(app)
+fn fifo_pop(c: Chip)
+    let head = at(c.st, 10)
+    if at(c.st, 98) / 6 - head <= 0
+        return
+    for i in 0..6
+        c.regs.insert(0x28 + i, at(c.fifo, head * 6 + i))
+    c.st.insert(10, head + 1)
+
+// A register as the part answers it.  CTRL2 shows its self-clearing bits
+// for as many reads as the test set; CTRL3 shows a running conversion the
+// same way and puts the sample in the registers when it ends; STATUS
+// answers 0 for as many reads as the test set.
+@tier(app)
+fn chip_read(c: Chip, reg: Int) -> Int
+    if reg == 0x21 and at(c.st, 42) != 0
+        if at(c.st, 40) > 0
+            c.st.insert(40, at(c.st, 40) - 1)
+            return at(c.regs, 0x21) | at(c.st, 42)
+        c.st.insert(42, 0)
+    if reg == 0x22 and at(c.st, 63) == 1
+        if at(c.st, 62) != 0
+            if at(c.st, 62) > 0
+                c.st.insert(62, at(c.st, 62) - 1)
+            return at(c.regs, 0x22) | 0x01
+        c.st.insert(63, 0)
+        c.regs.insert(0x27, 0x01)
+    if reg == 0x27 and at(c.st, 50) > 0
+        c.st.insert(50, at(c.st, 50) - 1)
+        return 0
+    if reg == 0x2F
+        return fifo_diff(c)
+    if reg == 0x28 and fifo_on(c)
+        fifo_pop(c)
+    if reg >= 0x28 and reg <= 0x2D
+        let axis = (reg - 0x28) / 2
+        let lo = 0x28 + axis * 2
+        let v = (at(c.regs, lo) | (at(c.regs, lo + 1) << 8)) + st_counts(c, axis)
+        if (reg - 0x28) % 2 == 0
+            return v & 0xFF
+        return (v >> 8) & 0xFF
+    at(c.regs, reg)
+
+// The reset values of the control registers.
+@tier(app)
+fn chip_reset(c: Chip)
+    for r in 0x20..0x27
+        c.regs.insert(r, 0)
+    c.regs.insert(0x21, 0x04)
+    c.regs.insert(0x2E, 0)
+    for r in 0x30..0x37
+        c.regs.insert(r, 0)
+    c.regs.insert(0x3F, 0)
+
+// A write to a register, which a read-only one ignores.  CTRL2's reset and
+// boot bits clear themselves after the reads the test set, and the reset
+// restores the control registers; CTRL3's SLP_MODE_1 starts a conversion
+// that clears itself; a FIFO put in bypass is emptied.
+@tier(app)
+fn chip_write(c: Chip, reg: Int, v: Int)
+    let n = at(c.st, 80)
+    c.wl.insert(n * 2, reg)
+    c.wl.insert(n * 2 + 1, v & 0xFF)
+    c.st.insert(80, n + 1)
+    if at(c.ro, reg) == 1
+        return
+    if reg == 0x21
+        let pending = v & 0xC0
+        c.regs.insert(0x21, v & 0x3F)
+        if (pending & 0x40) != 0
+            chip_reset(c)
+        if pending != 0
+            c.st.insert(42, pending)
+            var reads = at(c.st, 41)
+            if reads < 0
+                reads = 1000000
+            c.st.insert(40, reads)
+        return
+    if reg == 0x22
+        c.regs.insert(0x22, v & 0xFE)
+        if (v & 1) != 0
+            var reads = at(c.st, 61)
+            if reads < 0
+                reads = -1
+            c.st.insert(62, reads)
+            c.st.insert(63, 1)
+        return
+    c.regs.insert(reg, v & 0xFF)
+    if reg == 0x2E and (v >> 5) == 0
+        c.st.insert(10, at(c.st, 98) / 6)
+
+struct FakeI2c
+    c: Chip
+
+impl I2cBus for FakeI2c
+    @tier(app)
+    fn init(self, freq: Int) [hw]
+        self.c.st.insert(22, freq)
+
+    @tier(app)
+    fn write(self, addr: Int, data: [u8]) -> Bool [hw]
+        log_push(self.c, 1)
+        log_push(self.c, addr)
+        for b in data
+            log_push(self.c, b as Int)
+        log_push(self.c, -1)
+        if addr != 0x18 or not present(self.c) or data.len() < 2
+            return false
+        var r = data[0] as Int & 0x7F
+        for i in 1..data.len()
+            chip_write(self.c, r, data[i] as Int)
+            if (at(self.c.regs, 0x21) & 0x04) != 0
+                r = r + 1
+        true
+
+    @tier(app)
+    fn read(self, addr: Int, n: Int) -> ?[u8] [hw]
+        None
+
+    @tier(app)
+    fn write_read(self, addr: Int, tx: [u8], n: Int) -> ?[u8] [hw]
+        log_push(self.c, 2)
+        log_push(self.c, addr)
+        log_push(self.c, tx[0] as Int)
+        log_push(self.c, n)
+        log_push(self.c, -1)
+        if addr != 0x18 or not present(self.c)
+            return None
+        var r = tx[0] as Int & 0x7F
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, chip_read(self.c, r) as u8)
+            if (at(self.c.regs, 0x21) & 0x04) != 0
+                r = r + 1
+        Some(out)
+
+struct FakeSpi
+    c: Chip
+
+impl SpiBus for FakeSpi
+    @tier(app)
+    fn init(self, freq: Int, mode: Int) [hw]
+        self.c.st.insert(20, freq)
+        self.c.st.insert(21, mode)
+
+    @tier(app)
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.c.st, 9) == 1
+            log_push(self.c, b)
+        if at(self.c.st, 0) == 0
+            self.c.st.insert(0, 1)
+            self.c.st.insert(1, b & 0x7F)
+            self.c.st.insert(2, (b >> 7) & 1)
+            var heard = 0
+            if present(self.c)
+                heard = 1
+            self.c.st.insert(5, heard)
+            return 0xFF
+        if at(self.c.st, 5) == 0
+            return 0xFF
+        let r = at(self.c.st, 1)
+        if (at(self.c.regs, 0x21) & 0x04) != 0
+            self.c.st.insert(1, (r + 1) & 0x7F)
+        if at(self.c.st, 2) == 1
+            return chip_read(self.c, r)
+        chip_write(self.c, r, b)
+        0xFF
+
+    @tier(app)
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    @tier(app)
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: the chip select (pin 67) falling starts an SPI
+// transaction and rising ends it.
+struct FakePins
+    c: Chip
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    @tier(app)
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    @tier(app)
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if pin == 67 and val == 0
+            self.c.st.insert(0, 0)
+            self.c.st.insert(9, 1)
+            log_push(self.c, 3)
+        if pin == 67 and val == 1 and at(self.c.st, 9) == 1
+            self.c.st.insert(9, 0)
+            log_push(self.c, -1)
+
+    @tier(app)
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+@tier(app)
+fn pins(c: Chip) -> FakePins
+    FakePins { c: c, levels: HashMap.new(), modes: HashMap.new() }
+
+// The two ports, as a type that holds a bus implements them: every method
+// is the package's own function over the double.
+struct I2cDut
+    bus: FakeI2c
+    pins: FakePins
+    w: DeviceWiring
+
+impl Lis2dw12Port for I2cDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        lis2dw12.i2c_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        lis2dw12.i2c_read_into(self.bus, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        lis2dw12.i2c_write(self.bus, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        lis2dw12.irq_level_of(self.pins, self.w)
+
+struct SpiDut
+    bus: FakeSpi
+    pins: FakePins
+    w: DeviceWiring
+
+impl Lis2dw12Port for SpiDut
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        lis2dw12.spi_setup(self.bus, self.pins, self.w)
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        lis2dw12.spi_read_into(self.bus, self.pins, self.w, reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        lis2dw12.spi_write(self.bus, self.pins, self.w, reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        lis2dw12.irq_level_of(self.pins, self.w)
+
+// The board's wiring: the part at 0x18 on I2C, INT1 on pin 65.
+@tier(app)
+fn i2c_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_i2c(0, 0x18), 65)
+
+// The part on SPI: chip select on pin 67, INT1 on pin 65.
+@tier(app)
+fn spi_wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
+
+@tier(app)
+fn i2c_dut(c: Chip) -> I2cDut
+    I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: i2c_wiring() }
+
+@tier(app)
+fn spi_dut(c: Chip) -> SpiDut
+    SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: spi_wiring() }
+
+// Asserts the log holds exactly `want`, then empties it.
+@tier(app)
+fn log_is(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 99), want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.log, i), want[i])
+    log_clear(c)
+
+// Asserts the writes that reached the part are `want`, as register and byte
+// pairs, then forgets them.
+@tier(app)
+fn writes_are(c: Chip, want: [Int])
+    test.assert_eq(at(c.st, 80) * 2, want.len())
+    for i in 0..want.len()
+        test.assert_eq(at(c.wl, i), want[i])
+    c.st.insert(80, 0)
+
+@tier(app)
+fn reg_of(c: Chip, r: Int) -> Int
+    at(c.regs, r)
+
+// Sets the 16-bit word of an axis, low byte first, at `reg`.
+@tier(app)
+fn put16(c: Chip, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    c.regs.insert(reg, u & 0xFF)
+    c.regs.insert(reg + 1, u >> 8)
+
+// Sets the three axes to 14-bit counts, left-justified.
+@tier(app)
+fn put14(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x28, x * 4)
+    put16(c, 0x2A, y * 4)
+    put16(c, 0x2C, z * 4)
+
+// Sets the three axes to 12-bit counts, left-justified.
+@tier(app)
+fn put12(c: Chip, x: Int, y: Int, z: Int)
+    put16(c, 0x28, x * 16)
+    put16(c, 0x2A, y * 16)
+    put16(c, 0x2C, z * 16)
+
+// Appends a byte to the FIFO.
+@tier(app)
+fn fifo_put(c: Chip, v: Int)
+    let n = at(c.st, 98)
+    c.fifo.insert(n, v)
+    c.st.insert(98, n + 1)
+
+// A FIFO sample of three 14-bit counts.
+@tier(app)
+fn fifo_push(c: Chip, x: Int, y: Int, z: Int)
+    for v in [x * 4, y * 4, z * 4]
+        let u = v & 0xFFFF
+        fifo_put(c, u & 0xFF)
+        fifo_put(c, u >> 8)
+
+@tier(app)
+fn x_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.x
+        None    => -99999
+
+@tier(app)
+fn y_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.y
+        None    => -99999
+
+@tier(app)
+fn z_of(o: ?AccelMilliG) -> Int
+    match o
+        Some(a) => a.z
+        None    => -99999
+
+@tier(app)
+fn milli_c_of(o: ?TempMilliC) -> Int
+    match o
+        Some(t) => t.milli_c
+        None    => -99999
+
+// The log of an SPI read: the command, then `n` bytes of 0xFF, which is
+// what the controller clocks out while it reads.
+@tier(app)
+fn spi_read_log(cmd: Int, n: Int) -> [Int]
+    var out: [Int] = [3, cmd]
+    for _i in 0..n
+        list.push(out, 0xFF)
+    list.push(out, -1)
+    out
+
+// ── The two buses' framing ───────────────────────────────────────────
+
+@test
+fn test_an_i2c_read_of_one_register_sends_the_bare_sub_address() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(lis2dw12.reg_read(d, 0x0F) ?? -1, 0x44)
+    log_is(c, [2, 0x18, 0x0F, 1, -1])
+
+@test
+fn test_an_i2c_read_of_a_run_has_no_increment_bit_in_the_sub_address() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x28, 11)
+    c.regs.insert(0x29, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x28, 2, var b))
+    log_is(c, [2, 0x18, 0x28, 2, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+
+@test
+fn test_an_i2c_write_is_the_register_then_the_byte() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.write_reg(0x20, 0x57))
+    log_is(c, [1, 0x18, 0x20, 0x57, -1])
+    test.assert_eq(reg_of(c, 0x20), 0x57)
+
+@test
+fn test_a_missing_i2c_part_does_not_answer() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(lis2dw12.reg_read(d, 0x0F) == None)
+    test.assert(not d.write_reg(0x20, 0x57))
+    test.assert(not lis2dw12.reg_write(d, 0x20, 0x57))
+    test.assert(lis2dw12.id_read(d) == None)
+
+@test
+fn test_an_spi_read_sets_rw_and_one_register_does_not_increment() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert_eq(lis2dw12.reg_read(d, 0x0F) ?? -1, 0x44)
+    log_is(c, [3, 0x8F, 0xFF, -1])
+    test.assert_eq(at(d.pins.levels, 67), 1)
+
+@test
+fn test_an_spi_read_of_a_run_sets_rw_only_because_the_part_increments_by_itself() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    c.regs.insert(0x28, 11)
+    c.regs.insert(0x29, 22)
+    c.regs.insert(0x2A, 33)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x28, 3, var b))
+    log_is(c, [3, 0xA8, 0xFF, 0xFF, 0xFF, -1])
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 22)
+    test.assert_eq(b[2] as Int, 33)
+
+@test
+fn test_a_run_with_the_increment_cleared_repeats_the_first_register() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    c.regs.insert(0x21, 0)
+    c.regs.insert(0x28, 11)
+    c.regs.insert(0x29, 22)
+    var b: DevBytes = Vec.new()
+    test.assert(d.read_regs(0x28, 2, var b))
+    test.assert_eq(b[0] as Int, 11)
+    test.assert_eq(b[1] as Int, 11)
+
+@test
+fn test_an_spi_write_clears_rw() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.write_reg(0x20, 0x57))
+    log_is(c, [3, 0x20, 0x57, -1])
+    test.assert_eq(reg_of(c, 0x20), 0x57)
+
+@test
+fn test_an_spi_part_that_is_not_there_reads_0xff_and_is_no_part() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = spi_dut(c)
+    test.assert_eq(lis2dw12.reg_read(d, 0x0F) ?? -1, 0xFF)
+    test.assert(lis2dw12.id_read(d) == None)
+    c.st.insert(4, 1)
+    c.regs.insert(0x0F, 0)
+    test.assert(lis2dw12.id_read(d) == None)
+
+@test
+fn test_a_wiring_with_no_chip_select_runs_no_spi_transaction() [io, hw]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let d = SpiDut { bus: FakeSpi { c: c }, pins: pins(c), w: w }
+    var b: DevBytes = Vec.new()
+    test.assert(not d.read_regs(0x0F, 1, var b))
+    test.assert(not d.write_reg(0x20, 1))
+    test.assert(not d.setup())
+    test.assert(lis2dw12.reg_read(d, 0x0F) == None)
+    log_is(c, [])
+
+@test
+fn test_a_wiring_with_no_address_is_not_an_i2c_part() [io, hw]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let d = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: w }
+    test.assert(not d.setup())
+
+@test
+fn test_i2c_setup_makes_the_interrupt_pin_an_input_and_the_bus_fast() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 22), 400000)
+
+@test
+fn test_spi_setup_drives_chip_select_high_before_it_is_an_output() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(d.setup())
+    test.assert_eq(at(d.pins.levels, 67), 1)
+    test.assert_eq(at(d.pins.modes, 67), 1)
+    test.assert_eq(at(d.pins.modes, 65), 0)
+    test.assert_eq(at(c.st, 20), 4000000)
+    test.assert_eq(at(c.st, 21), 3)
+    log_is(c, [])
+
+@test
+fn test_the_interrupt_line_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(d.irq_level(), 0)
+    d.pins.levels.insert(65, 1)
+    test.assert_eq(d.irq_level(), 1)
+    let bare = I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: dev_bus.wiring_i2c(0, 0x18) }
+    test.assert_eq(bare.irq_level(), -1)
+    let s = spi_dut(c)
+    test.assert_eq(s.irq_level(), 0)
+
+@test
+fn test_the_identity_is_who_am_i_on_both_buses() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    let id = lis2dw12.id_read(d) ?? DeviceId { who: -1, rev: None }
+    test.assert_eq(id.who, 0x44)
+    test.assert(id.rev == None)
+    let s = spi_dut(c)
+    test.assert_eq((lis2dw12.id_read(s) ?? DeviceId { who: -1, rev: None }).who, 0x44)
+
+// ── Conversions ──────────────────────────────────────────────────────
+
+@test
+fn test_the_range_bits_round_trip() [io, hw]
+    test.assert(lis2dw12.range_of_ctrl6(0x00) == AccelRange.AccelRange2g)
+    test.assert(lis2dw12.range_of_ctrl6(0x10) == AccelRange.AccelRange4g)
+    test.assert(lis2dw12.range_of_ctrl6(0x20) == AccelRange.AccelRange8g)
+    test.assert(lis2dw12.range_of_ctrl6(0x34) == AccelRange.AccelRange16g)
+    test.assert_eq(lis2dw12.fs_of_range(AccelRange.AccelRange2g), 0)
+    test.assert_eq(lis2dw12.fs_of_range(AccelRange.AccelRange4g), 1)
+    test.assert_eq(lis2dw12.fs_of_range(AccelRange.AccelRange8g), 2)
+    test.assert_eq(lis2dw12.fs_of_range(AccelRange.AccelRange16g), 3)
+
+@test
+fn test_the_mode_follows_the_mode_field() [io, hw]
+    test.assert(lis2dw12.mode_of_ctrl1(0x00) == Lis2dwMode.Lis2dwLowPower)
+    test.assert(lis2dw12.mode_of_ctrl1(0x53) == Lis2dwMode.Lis2dwLowPower)
+    test.assert(lis2dw12.mode_of_ctrl1(0x54) == Lis2dwMode.Lis2dwHighPerf)
+    test.assert(lis2dw12.mode_of_ctrl1(0x28) == Lis2dwMode.Lis2dwOnDemand)
+    test.assert(lis2dw12.mode_of_ctrl1(0x0C) == Lis2dwMode.Lis2dwLowPower)
+    test.assert_eq(lis2dw12.mode_bits(Lis2dwMode.Lis2dwLowPower), 0)
+    test.assert_eq(lis2dw12.mode_bits(Lis2dwMode.Lis2dwHighPerf), 1)
+    test.assert_eq(lis2dw12.mode_bits(Lis2dwMode.Lis2dwOnDemand), 2)
+
+@test
+fn test_the_width_is_14_bits_except_in_low_power_mode_1() [io, hw]
+    // High-Performance Mode is 14 bits whatever LP_MODE says.
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x54), 14)
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x57), 14)
+    // The low-power modes: level 1 is 12 bits, levels 2 to 4 are 14.
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x50), 12)
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x51), 14)
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x52), 14)
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x53), 14)
+    // The single conversion mode takes the width from LP_MODE.
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x28), 12)
+    test.assert_eq(lis2dw12.bits_of_ctrl1(0x29), 14)
+    test.assert_eq(lis2dw12.lp_level_of_ctrl1(0x00), 1)
+    test.assert_eq(lis2dw12.lp_level_of_ctrl1(0x03), 4)
+
+@test
+fn test_the_step_is_the_data_sheet_figure_in_each_width() [io, hw]
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange2g, 14), 244)
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange4g, 14), 488)
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange8g, 14), 976)
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange16g, 14), 1952)
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange2g, 12), 976)
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange4g, 12), 1952)
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange8g, 12), 3904)
+    test.assert_eq(lis2dw12.ug_per_digit(AccelRange.AccelRange16g, 12), 7808)
+
+@test
+fn test_the_rate_codes_mean_other_rates_in_high_performance_mode() [io, hw]
+    // The low-power modes (Table 29): code 1 is 1.6 Hz and 400 Hz and up
+    // are 200 Hz.
+    test.assert_eq(lis2dw12.rate_mhz_of(0x00), 0)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x10), 1600)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x20), 12500)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x30), 25000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x40), 50000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x50), 100000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x60), 200000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x70), 200000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x80), 200000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x90), 200000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0xA0), 0)
+    // High-Performance Mode: code 1 is 12.5 Hz and the top codes go to
+    // 1.6 kHz.
+    test.assert_eq(lis2dw12.rate_mhz_of(0x04), 0)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x14), 12500)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x24), 12500)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x34), 25000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x44), 50000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x54), 100000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x64), 200000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x74), 400000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x84), 800000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0x94), 1600000)
+    test.assert_eq(lis2dw12.rate_mhz_of(0xA4), 0)
+
+@test
+fn test_a_requested_rate_rounds_up_within_the_mode() [io, hw]
+    // Low-power modes.
+    test.assert_eq(lis2dw12.odr_for_rate(0, false), 1)
+    test.assert_eq(lis2dw12.odr_for_rate(1, false), 1)
+    test.assert_eq(lis2dw12.odr_for_rate(2, false), 2)
+    test.assert_eq(lis2dw12.odr_for_rate(12, false), 2)
+    test.assert_eq(lis2dw12.odr_for_rate(13, false), 3)
+    test.assert_eq(lis2dw12.odr_for_rate(26, false), 4)
+    test.assert_eq(lis2dw12.odr_for_rate(51, false), 5)
+    test.assert_eq(lis2dw12.odr_for_rate(101, false), 6)
+    test.assert_eq(lis2dw12.odr_for_rate(5000, false), 6)
+    // High-Performance Mode has no 1.6 Hz and goes to 1.6 kHz.
+    test.assert_eq(lis2dw12.odr_for_rate(0, true), 2)
+    test.assert_eq(lis2dw12.odr_for_rate(1, true), 2)
+    test.assert_eq(lis2dw12.odr_for_rate(25, true), 3)
+    test.assert_eq(lis2dw12.odr_for_rate(50, true), 4)
+    test.assert_eq(lis2dw12.odr_for_rate(100, true), 5)
+    test.assert_eq(lis2dw12.odr_for_rate(200, true), 6)
+    test.assert_eq(lis2dw12.odr_for_rate(201, true), 7)
+    test.assert_eq(lis2dw12.odr_for_rate(400, true), 7)
+    test.assert_eq(lis2dw12.odr_for_rate(401, true), 8)
+    test.assert_eq(lis2dw12.odr_for_rate(800, true), 8)
+    test.assert_eq(lis2dw12.odr_for_rate(801, true), 9)
+    test.assert_eq(lis2dw12.odr_for_rate(9999, true), 9)
+
+@test
+fn test_the_turn_on_time_of_a_conversion_on_demand() [io, hw]
+    test.assert_eq(lis2dw12.t_on_us(1), 1200)
+    test.assert_eq(lis2dw12.t_on_us(2), 1700)
+    test.assert_eq(lis2dw12.t_on_us(3), 2300)
+    test.assert_eq(lis2dw12.t_on_us(4), 3550)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_in_high_performance_mode_is_14_bits_at_the_range_it_was_taken_in() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    put14(c, 1000, -1000, 4096)
+    let a = lis2dw12.sample_read(d)
+    // One burst of fourteen registers from CTRL1.
+    log_is(c, [2, 0x18, 0x20, 14, -1])
+    test.assert_eq(x_of(a), 244)
+    test.assert_eq(y_of(a), -244)
+    test.assert_eq(z_of(a), 999)
+    c.regs.insert(0x25, 0x10)
+    test.assert_eq(x_of(lis2dw12.sample_read(d)), 488)
+    c.regs.insert(0x25, 0x20)
+    test.assert_eq(x_of(lis2dw12.sample_read(d)), 976)
+    c.regs.insert(0x25, 0x30)
+    test.assert_eq(x_of(lis2dw12.sample_read(d)), 1952)
+    test.assert_eq(z_of(lis2dw12.sample_read(d)), 7995)
+
+@test
+fn test_full_scale_in_14_bits_is_just_under_the_range() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    put14(c, 8191, -8192, 0)
+    test.assert_eq(x_of(lis2dw12.sample_read(d)), 1998)
+    test.assert_eq(y_of(lis2dw12.sample_read(d)), -1998)
+
+@test
+fn test_a_sample_in_low_power_mode_1_is_12_bits_with_a_step_four_times_as_far() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x40)
+    put12(c, 1000, -1000, 1024)
+    let a = lis2dw12.sample_read(d)
+    test.assert_eq(x_of(a), 976)
+    test.assert_eq(y_of(a), -976)
+    test.assert_eq(z_of(a), 999)
+    // Level 2 is 14 bits: the words are left-justified in both widths, so the
+    // same word is the same acceleration.
+    c.regs.insert(0x20, 0x41)
+    test.assert_eq(x_of(lis2dw12.sample_read(d)), 976)
+    c.regs.insert(0x20, 0x42)
+    put14(c, 1000, 0, 0)
+    test.assert_eq(x_of(lis2dw12.sample_read(d)), 244)
+
+@test
+fn test_a_sample_over_spi_is_the_same_burst() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    c.regs.insert(0x20, 0x54)
+    put14(c, 1000, 2000, 3000)
+    let a = lis2dw12.sample_read(d)
+    log_is(c, spi_read_log(0xA0, 14))
+    test.assert_eq(x_of(a), 244)
+    test.assert_eq(y_of(a), 488)
+    test.assert_eq(z_of(a), 732)
+
+@test
+fn test_no_part_gives_no_sample_and_is_never_ready() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(lis2dw12.sample_read(d) == None)
+    test.assert(not lis2dw12.sample_ready(d))
+
+@test
+fn test_ready_is_the_drdy_flag() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(not lis2dw12.sample_ready(d))
+    c.regs.insert(0x27, 0x01)
+    test.assert(lis2dw12.sample_ready(d))
+    // The event flags above DRDY do not make a sample.
+    c.regs.insert(0x27, 0xFE)
+    test.assert(not lis2dw12.sample_ready(d))
+
+@test
+fn test_the_range_is_written_without_touching_the_other_bits_of_ctrl6() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x25, 0xC4)
+    test.assert(lis2dw12.range_write(d, AccelRange.AccelRange8g))
+    test.assert_eq(reg_of(c, 0x25), 0xE4)
+    test.assert(lis2dw12.range_read(d) == AccelRange.AccelRange8g)
+    test.assert(lis2dw12.range_write(d, AccelRange.AccelRange2g))
+    test.assert_eq(reg_of(c, 0x25), 0xC4)
+
+@test
+fn test_an_update_changes_only_the_bits_of_its_mask() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x30, 0xAA)
+    test.assert(lis2dw12.reg_update(d, 0x30, 0x0F, 0xFF))
+    test.assert_eq(reg_of(c, 0x30), 0xAF)
+    test.assert(lis2dw12.reg_update(d, 0x30, 0xF0, 0x00))
+    test.assert_eq(reg_of(c, 0x30), 0x0F)
+
+@test
+fn test_a_register_that_ignores_the_write_is_not_taken() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.ro.insert(0x25, 1)
+    test.assert(not lis2dw12.range_write(d, AccelRange.AccelRange4g))
+    c.st.insert(4, 0)
+    test.assert(not lis2dw12.range_write(d, AccelRange.AccelRange4g))
+    test.assert(lis2dw12.range_read(d) == AccelRange.AccelRange2g)
+
+@test
+fn test_the_rate_is_written_keeping_the_mode_and_the_low_power_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x57)
+    // High-Performance Mode, level 4: 50 Hz is code 4.
+    test.assert_eq(lis2dw12.rate_write(d, 50), 50000)
+    test.assert_eq(reg_of(c, 0x20), 0x47)
+    test.assert_eq(lis2dw12.rate_mhz_read(d), 50000)
+    // Asked for 300 Hz it takes 400.
+    test.assert_eq(lis2dw12.rate_write(d, 300), 400000)
+    test.assert_eq(reg_of(c, 0x20), 0x77)
+    // A low-power mode stops at 200 Hz.
+    c.regs.insert(0x20, 0x42)
+    test.assert_eq(lis2dw12.rate_write(d, 300), 200000)
+    test.assert_eq(reg_of(c, 0x20), 0x62)
+    test.assert_eq(lis2dw12.rate_write(d, 1), 1600)
+    test.assert_eq(reg_of(c, 0x20), 0x12)
+    // A part in power-down is started by a rate.
+    c.regs.insert(0x20, 0x00)
+    test.assert_eq(lis2dw12.rate_write(d, 12), 12500)
+    test.assert_eq(reg_of(c, 0x20), 0x20)
+
+@test
+fn test_a_rate_on_a_silent_or_stubborn_part_is_zero() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.ro.insert(0x20, 1)
+    test.assert_eq(lis2dw12.rate_write(d, 100), 0)
+    c.st.insert(4, 0)
+    test.assert_eq(lis2dw12.rate_write(d, 100), 0)
+    test.assert_eq(lis2dw12.rate_mhz_read(d), 0)
+
+@test
+fn test_the_mode_and_the_level_are_written_keeping_the_rate() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x50)
+    test.assert(lis2dw12.mode_write(d, Lis2dwMode.Lis2dwHighPerf, 1))
+    test.assert_eq(reg_of(c, 0x20), 0x54)
+    test.assert(lis2dw12.mode_read(d) == Lis2dwMode.Lis2dwHighPerf)
+    test.assert_eq(lis2dw12.resolution_read(d), 14)
+    test.assert(lis2dw12.mode_write(d, Lis2dwMode.Lis2dwLowPower, 1))
+    test.assert_eq(reg_of(c, 0x20), 0x50)
+    test.assert_eq(lis2dw12.resolution_read(d), 12)
+    test.assert_eq(lis2dw12.lp_level_read(d), 1)
+    test.assert(lis2dw12.mode_write(d, Lis2dwMode.Lis2dwLowPower, 4))
+    test.assert_eq(reg_of(c, 0x20), 0x53)
+    test.assert_eq(lis2dw12.lp_level_read(d), 4)
+    test.assert_eq(lis2dw12.resolution_read(d), 14)
+    // A level outside 1 to 4 is held to it.
+    test.assert(lis2dw12.mode_write(d, Lis2dwMode.Lis2dwLowPower, 9))
+    test.assert_eq(reg_of(c, 0x20), 0x53)
+    test.assert(lis2dw12.mode_write(d, Lis2dwMode.Lis2dwOnDemand, 0))
+    test.assert_eq(reg_of(c, 0x20), 0x58)
+    test.assert(lis2dw12.mode_read(d) == Lis2dwMode.Lis2dwOnDemand)
+
+@test
+fn test_low_noise_is_a_bit_of_ctrl6_and_leaves_ctrl1_alone() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x40)
+    c.regs.insert(0x25, 0x10)
+    test.assert(not lis2dw12.low_noise_read(d))
+    test.assert(lis2dw12.low_noise_write(d, true))
+    test.assert_eq(reg_of(c, 0x25), 0x14)
+    test.assert_eq(reg_of(c, 0x20), 0x40)
+    test.assert(lis2dw12.low_noise_read(d))
+    test.assert(lis2dw12.low_noise_write(d, false))
+    test.assert_eq(reg_of(c, 0x25), 0x10)
+    test.assert(not lis2dw12.low_noise_read(d))
+
+@test
+fn test_the_bandwidth_is_the_top_two_bits_of_ctrl6() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x25, 0x34)
+    test.assert(lis2dw12.bandwidth_write(d, 2))
+    test.assert_eq(reg_of(c, 0x25), 0xB4)
+    test.assert(lis2dw12.bandwidth_write(d, 9))
+    test.assert_eq(reg_of(c, 0x25), 0xF4)
+    test.assert(lis2dw12.bandwidth_write(d, -1))
+    test.assert_eq(reg_of(c, 0x25), 0x34)
+
+// ── The temperature ──────────────────────────────────────────────────
+
+@test
+fn test_the_temperature_is_25_degrees_at_zero_and_16_counts_to_the_degree() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(milli_c_of(lis2dw12.temp_read_milli_c(d)), 25000)
+    log_is(c, [2, 0x18, 0x0D, 2, -1])
+    // 3 counts is 187 mdeg: the word is left-justified in 16 bits.
+    put16(c, 0x0D, 3 * 16)
+    test.assert_eq(milli_c_of(lis2dw12.temp_read_milli_c(d)), 25187)
+    // -1 count is -62 mdeg: the sign of the 12-bit word is kept.
+    put16(c, 0x0D, 0xFFF0)
+    test.assert_eq(milli_c_of(lis2dw12.temp_read_milli_c(d)), 24938)
+    // 160 counts are 10 degrees: the word is 160 << 4.
+    put16(c, 0x0D, 2560)
+    test.assert_eq(milli_c_of(lis2dw12.temp_read_milli_c(d)), 35000)
+    put16(c, 0x0D, 0x8000)
+    test.assert_eq(milli_c_of(lis2dw12.temp_read_milli_c(d)), 25000 - 128000)
+
+@test
+fn test_a_temperature_over_spi_is_the_same_two_registers() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    put16(c, 0x0D, 512)
+    test.assert_eq(milli_c_of(lis2dw12.temp_read_milli_c(d)), 27000)
+    log_is(c, spi_read_log(0x8D, 2))
+
+@test
+fn test_no_part_gives_no_temperature_and_a_part_in_power_down_refuses_a_start() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // Power-down: the part keeps its last temperature, so a start is refused.
+    test.assert_eq(lis2dw12.temp_begin(d), -1)
+    c.regs.insert(0x20, 0x54)
+    test.assert_eq(lis2dw12.temp_begin(d), 0)
+    c.st.insert(4, 0)
+    test.assert(lis2dw12.temp_read_milli_c(d) == None)
+    test.assert_eq(lis2dw12.temp_begin(d), -1)
+
+// ── The FIFO ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_fifo_starts_in_continuous_mode_with_the_threshold_on_int1() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(lis2dw12.fifo_start(d, 10))
+    writes_are(c, [0x2E, 0xCA, 0x23, 0x02])
+    test.assert(lis2dw12.fifo_start(d, 0))
+    test.assert_eq(reg_of(c, 0x2E), 0xC1)
+    test.assert(lis2dw12.fifo_start(d, 99))
+    test.assert_eq(reg_of(c, 0x2E), 0xDF)
+
+@test
+fn test_the_fifo_stops_in_bypass_and_puts_the_data_ready_back() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x2E, 0xCA)
+    c.regs.insert(0x23, 0x02)
+    test.assert(lis2dw12.fifo_stop(d))
+    writes_are(c, [0x2E, 0x00, 0x23, 0x01])
+
+@test
+fn test_a_silent_part_does_not_start_or_stop_a_fifo() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(not lis2dw12.fifo_start(d, 10))
+    test.assert(not lis2dw12.fifo_stop(d))
+    test.assert_eq(lis2dw12.fifo_count(d), 0)
+
+@test
+fn test_the_fifo_count_is_the_six_bit_difference_with_a_full_fifo_reading_32() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert_eq(lis2dw12.fifo_count(d), 0)
+    fifo_push(c, 1, 2, 3)
+    fifo_push(c, 4, 5, 6)
+    test.assert_eq(lis2dw12.fifo_count(d), 2)
+    for i in 0..40
+        fifo_push(c, i, i, i)
+    test.assert_eq(lis2dw12.fifo_count(d), 32)
+
+@test
+fn test_the_fifo_read_moves_the_samples_oldest_first_each_with_its_own_burst() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x2E, 0xC3)
+    fifo_push(c, 1000, 0, 0)
+    fifo_push(c, 2000, -1000, 4096)
+    fifo_push(c, 0, 0, -4096)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    let n = lis2dw12.fifo_read(d, var out)
+    test.assert_eq(n, 3)
+    test.assert_eq(out.len(), 3)
+    test.assert_eq(out[0].x, 244)
+    test.assert_eq(out[1].x, 488)
+    test.assert_eq(out[1].y, -244)
+    test.assert_eq(out[1].z, 999)
+    test.assert_eq(out[2].z, -999)
+    // The count once, then a burst of fourteen for each sample.
+    log_is(c, [2, 0x18, 0x2F, 1, -1, 2, 0x18, 0x20, 14, -1, 2, 0x18, 0x20, 14, -1, 2, 0x18, 0x20, 14, -1])
+    test.assert_eq(lis2dw12.fifo_count(d), 0)
+
+@test
+fn test_an_empty_fifo_moves_nothing_and_empties_the_destination() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    let _ = out.push(AccelMilliG { x: 1, y: 2, z: 3 })
+    test.assert_eq(lis2dw12.fifo_read(d, var out), 0)
+    test.assert_eq(out.len(), 0)
+
+@test
+fn test_a_part_that_goes_silent_in_the_middle_of_a_fifo_read_stops_it() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x2E, 0xC3)
+    fifo_push(c, 1000, 0, 0)
+    fifo_push(c, 2000, 0, 0)
+    fifo_push(c, 3000, 0, 0)
+    // It answers the count and one sample.
+    c.st.insert(70, 2)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(lis2dw12.fifo_read(d, var out), 1)
+    test.assert_eq(out.len(), 1)
+    test.assert_eq(out[0].x, 244)
+
+// ── Conversion on demand ─────────────────────────────────────────────
+
+@test
+fn test_arming_a_conversion_selects_the_software_trigger_and_the_mode_keeping_the_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x53)
+    c.regs.insert(0x22, 0x08)
+    test.assert(lis2dw12.single_arm(d))
+    // SLP_MODE_SEL set and the other bits of CTRL3 kept; MODE 10, the 12.5 Hz
+    // code and LP_MODE kept.
+    test.assert_eq(reg_of(c, 0x22), 0x0A)
+    test.assert_eq(reg_of(c, 0x20), 0x2B)
+    c.st.insert(4, 0)
+    test.assert(not lis2dw12.single_arm(d))
+
+@test
+fn test_a_trigger_sets_sel_and_start_without_a_read_back_and_a_conversion_clears_it() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x22, 0x08)
+    test.assert(lis2dw12.single_trigger(d))
+    writes_are(c, [0x22, 0x0B])
+    // The bit cleared itself at once, with the sample in the registers.
+    test.assert_eq(reg_of(c, 0x22), 0x0A)
+    test.assert(lis2dw12.single_done(d))
+    c.st.insert(4, 0)
+    test.assert(not lis2dw12.single_trigger(d))
+    test.assert(not lis2dw12.single_done(d))
+
+@test
+fn test_a_conversion_on_demand_waits_for_the_bit_and_converts_in_the_mode_it_was_taken_in() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x28)
+    put12(c, 500, -500, 1024)
+    // The conversion takes three reads of CTRL3.
+    c.st.insert(61, 3)
+    let a = lis2dw12.convert_once(d)
+    test.assert_eq(x_of(a), 488)
+    test.assert_eq(y_of(a), -488)
+    test.assert_eq(z_of(a), 999)
+    test.assert_eq(reg_of(c, 0x27), 1)
+
+@test
+fn test_a_conversion_that_never_ends_gives_nothing() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.st.insert(61, -1)
+    test.assert(lis2dw12.convert_once(d) == None)
+    c.st.insert(4, 0)
+    test.assert(lis2dw12.convert_once(d) == None)
+
+// ── Waiting on a host's scheduler ────────────────────────────────────
+
+// A timer that records each sleep (`st[0]` their number, `st[1]` the last
+// length in microseconds) and lets the part make progress: each sleep
+// counts down a conversion or a data-ready delay of the chip.
+struct FakeTimer
+    c: Chip
+
+impl TimerAsync for FakeTimer
+    @tier(app)
+    async fn sleep_ms(self, ms: Int) [hw]
+        self.c.st.insert(100, at(self.c.st, 100) + 1)
+        self.c.st.insert(101, ms * 1000)
+
+    @tier(app)
+    async fn sleep_us(self, us: Int) [hw]
+        self.c.st.insert(100, at(self.c.st, 100) + 1)
+        self.c.st.insert(101, us)
+
+@test
+fn test_an_awaited_conversion_parks_for_the_turn_on_time_then_reads() [io, hw, async]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x2A)
+    put14(c, 500, 0, 0)
+    let a = await lis2dw12.accel_measure(d, FakeTimer { c: c })
+    // Low-Power Mode 3: 2.30 ms.
+    test.assert_eq(at(c.st, 101), 2300)
+    test.assert_eq(at(c.st, 100), 1)
+    test.assert_eq(x_of(a), 122)
+
+@test
+fn test_an_awaited_conversion_that_is_slow_parks_again_and_gives_up_after_four() [io, hw, async]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x29)
+    put14(c, 500, 0, 0)
+    c.st.insert(61, 2)
+    let a = await lis2dw12.accel_measure(d, FakeTimer { c: c })
+    test.assert_eq(at(c.st, 100), 3)
+    test.assert_eq(at(c.st, 101), 1700)
+    test.assert_eq(x_of(a), 122)
+    let c2 = chip()
+    c2.st.insert(61, -1)
+    test.assert(await lis2dw12.accel_measure(i2c_dut(c2), FakeTimer { c: c2 }) == None)
+    test.assert_eq(at(c2.st, 100), 4)
+    let c3 = chip()
+    c3.st.insert(4, 0)
+    test.assert(await lis2dw12.accel_measure(i2c_dut(c3), FakeTimer { c: c3 }) == None)
+    test.assert_eq(at(c3.st, 100), 0)
+
+@test
+fn test_an_awaited_sample_parks_until_the_flag_is_set() [io, hw, async]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x27, 0x01)
+    put14(c, 1000, 0, 0)
+    // Two reads of STATUS answer not ready.
+    c.st.insert(50, 2)
+    let a = await lis2dw12.accel_next(d, FakeTimer { c: c }, 5000, 10)
+    test.assert_eq(at(c.st, 100), 2)
+    test.assert_eq(at(c.st, 101), 5000)
+    test.assert_eq(x_of(a), 244)
+
+@test
+fn test_an_awaited_sample_that_never_comes_gives_nothing() [io, hw, async]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(await lis2dw12.accel_next(d, FakeTimer { c: c }, 1000, 3) == None)
+    test.assert_eq(at(c.st, 100), 3)
+
+// The interrupt line as a board that edges are armed on delivers it:
+// `st[110]` is the pin armed, `st[111]` the edge, and a refusal is set
+// with `st[112]`.
+struct FakeEdge
+    c: Chip
+
+impl AsyncEdge[hw] for FakeEdge
+    @tier(app)
+    fn edge_arm(self, pin: Int, edge: Int, f: Future) -> Int [hw]
+        if at(self.c.st, 112) != 0
+            return -2
+        self.c.st.insert(110, pin)
+        self.c.st.insert(111, edge)
+        0
+
+    @tier(app)
+    fn edge_disarm(self, pin: Int) -> Bool [hw]
+        pin == at(self.c.st, 110)
+
+    @tier(app)
+    fn edge_irqs(self) -> Int [hw]
+        0
+
+@test
+fn test_the_interrupt_line_is_armed_on_a_rising_edge_through_the_board() [io, hw]
+    let c = chip()
+    let f = core.rt.future_new()
+    test.assert_eq(lis2dw12.irq_arm(FakeEdge { c: c }, i2c_wiring(), f), 0)
+    test.assert_eq(at(c.st, 110), 65)
+    test.assert_eq(at(c.st, 111), 0)
+    test.assert(lis2dw12.irq_disarm(FakeEdge { c: c }, i2c_wiring()))
+    c.st.insert(112, 1)
+    test.assert_eq(lis2dw12.irq_arm(FakeEdge { c: c }, i2c_wiring(), f), -2)
+    // A wiring with no interrupt pin arms nothing.
+    let bare = dev_bus.wiring_i2c(0, 0x18)
+    test.assert_eq(lis2dw12.irq_arm(FakeEdge { c: c }, bare, f), -1)
+    test.assert(not lis2dw12.irq_disarm(FakeEdge { c: c }, bare))
+    core.rt.future_drop(f)
+
+// ── Self-test ────────────────────────────────────────────────────────
+
+@test
+fn test_the_self_test_is_the_change_the_sign_bits_make_at_4_g() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x22, 0x08)
+    c.regs.insert(0x25, 0x20)
+    c.regs.insert(0x27, 0x01)
+    put14(c, 10, 20, 2000)
+    c.st.insert(30, 1000)
+    c.st.insert(31, 1200)
+    c.st.insert(32, 2500)
+    // ±4 g is 0.488 mg a digit.
+    let p = lis2dw12.self_test_delta(d, false)
+    test.assert_eq(x_of(p), 488)
+    test.assert_eq(y_of(p), 586)
+    test.assert_eq(z_of(p), 1220)
+    // The settings are put back, ST clear.
+    test.assert_eq(reg_of(c, 0x20), 0x54)
+    test.assert_eq(reg_of(c, 0x22), 0x08)
+    test.assert_eq(reg_of(c, 0x25), 0x20)
+    let n = lis2dw12.self_test_delta(d, true)
+    test.assert_eq(x_of(n), -487)
+    test.assert_eq(z_of(n), -1220)
+    test.assert_eq(reg_of(c, 0x22), 0x08)
+
+@test
+fn test_the_self_test_writes_the_settings_before_the_rate_and_the_sign_after_the_first_sample() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x27, 0x01)
+    let _ = lis2dw12.self_test_delta(d, false)
+    // Power-down, ±4 g, ST clear, 50 Hz in High-Performance Mode; then the
+    // positive sign; then everything put back.
+    writes_are(c,
+        [0x20, 0x00, 0x25, 0x10, 0x22, 0x00, 0x20, 0x44, 0x22, 0x40, 0x22, 0x00, 0x25, 0x00, 0x20, 0x54])
+
+@test
+fn test_the_self_test_window_is_the_data_sheet_s() [io, hw]
+    let ok = AccelMilliG { x: 70, y: -1500, z: 800 }
+    test.assert(lis2dw12.self_test_ok(ok))
+    test.assert(not lis2dw12.self_test_ok(AccelMilliG { x: 69, y: 100, z: 100 }))
+    test.assert(not lis2dw12.self_test_ok(AccelMilliG { x: 100, y: 1501, z: 100 }))
+    test.assert(not lis2dw12.self_test_ok(AccelMilliG { x: 100, y: 100, z: -2000 }))
+    test.assert(lis2dw12.self_test_within(AccelMilliG { x: 5, y: 6, z: 7 }, 5, 7))
+    test.assert(not lis2dw12.self_test_within(AccelMilliG { x: 5, y: 6, z: 8 }, 5, 7))
+
+@test
+fn test_a_self_test_with_no_data_ready_gives_nothing_and_restores_the_settings() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x25, 0x20)
+    test.assert(lis2dw12.self_test_delta(d, false) == None)
+    test.assert_eq(reg_of(c, 0x20), 0x54)
+    test.assert_eq(reg_of(c, 0x25), 0x20)
+
+@test
+fn test_a_self_test_that_loses_the_second_sample_gives_nothing() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x27, 0x01)
+    // The count of STATUS reads that answer ready before the flag drops:
+    // the part is allowed enough transactions for the first sample only.
+    c.st.insert(70, 12)
+    test.assert(lis2dw12.self_test_delta(d, false) == None)
+
+@test
+fn test_a_self_test_that_loses_the_first_sample_after_the_flag_gives_nothing() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0x54)
+    c.regs.insert(0x27, 0x01)
+    // Reads: three settings, four writes with read-backs, then the flag.
+    c.st.insert(70, 9)
+    test.assert(lis2dw12.self_test_delta(d, false) == None)
+
+@test
+fn test_a_self_test_on_a_silent_part_gives_nothing() [io, hw]
+    let c = chip()
+    c.st.insert(4, 0)
+    let d = i2c_dut(c)
+    test.assert(lis2dw12.self_test_delta(d, false) == None)
+    let c2 = chip()
+    let d2 = i2c_dut(c2)
+    // It answers the first read and no more.
+    c2.st.insert(70, 1)
+    test.assert(lis2dw12.self_test_delta(d2, false) == None)
+    let c3 = chip()
+    let d3 = i2c_dut(c3)
+    c3.st.insert(70, 2)
+    test.assert(lis2dw12.self_test_delta(d3, false) == None)
+
+// ── Event detectors and interrupt routing ────────────────────────────
+
+@test
+fn test_the_routing_replaces_the_pad_registers() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    test.assert(lis2dw12.int1_route(d, 0x61))
+    test.assert_eq(reg_of(c, 0x23), 0x61)
+    test.assert(lis2dw12.int2_route(d, 0x82))
+    test.assert_eq(reg_of(c, 0x24), 0x82)
+    c.st.insert(4, 0)
+    test.assert(not lis2dw12.int1_route(d, 1))
+    test.assert(not lis2dw12.int2_route(d, 1))
+
+@test
+fn test_the_detectors_are_turned_on_in_ctrl7_leaving_its_other_bits() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x3F, 0x04)
+    test.assert(lis2dw12.interrupts_enable(d, true))
+    test.assert_eq(reg_of(c, 0x3F), 0x24)
+    test.assert(lis2dw12.drdy_pulsed(d, true))
+    test.assert_eq(reg_of(c, 0x3F), 0xA4)
+    test.assert(lis2dw12.interrupts_enable(d, false))
+    test.assert_eq(reg_of(c, 0x3F), 0x84)
+    test.assert(lis2dw12.drdy_pulsed(d, false))
+    test.assert_eq(reg_of(c, 0x3F), 0x04)
+
+@test
+fn test_the_pins_electrical_form_is_ctrl3() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x22, 0xC2)
+    test.assert(lis2dw12.int_pins(d, true, true, true))
+    test.assert_eq(reg_of(c, 0x22), 0xFA)
+    test.assert(lis2dw12.int_pins(d, false, true, false))
+    test.assert_eq(reg_of(c, 0x22), 0xE2)
+    test.assert(lis2dw12.int_pins(d, false, false, false))
+    test.assert_eq(reg_of(c, 0x22), 0xC2)
+
+@test
+fn test_the_wake_up_threshold_is_a_sixty_fourth_of_the_range_per_step() [io, hw]
+    test.assert_eq(lis2dw12.wake_up_code(500, AccelRange.AccelRange2g), 16)
+    test.assert_eq(lis2dw12.wake_up_code(500, AccelRange.AccelRange4g), 8)
+    test.assert_eq(lis2dw12.wake_up_code(0, AccelRange.AccelRange2g), 1)
+    test.assert_eq(lis2dw12.wake_up_code(99999, AccelRange.AccelRange16g), 63)
+    test.assert_eq(lis2dw12.wake_up_mg(16, AccelRange.AccelRange2g), 500)
+    test.assert_eq(lis2dw12.wake_up_mg(63, AccelRange.AccelRange16g), 15750)
+
+@test
+fn test_the_wake_up_config_sets_the_threshold_and_the_duration_only() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x34, 0xC0)
+    c.regs.insert(0x35, 0x9F)
+    c.regs.insert(0x25, 0x10)
+    test.assert(lis2dw12.wake_up_config(d, 500, 2))
+    // ±4 g: 500 mg is 8 steps; bits 7 and 6 kept.
+    test.assert_eq(reg_of(c, 0x34), 0xC8)
+    test.assert_eq(reg_of(c, 0x35), 0xDF)
+    test.assert(lis2dw12.wake_up_config(d, 500, 7))
+    test.assert_eq(reg_of(c, 0x35), 0xFF)
+    test.assert(lis2dw12.wake_up_config(d, 500, -4))
+    test.assert_eq(reg_of(c, 0x35), 0x9F)
+
+@test
+fn test_the_activity_config_sets_sleep_stationary_and_the_sleep_duration() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x34, 0x8A)
+    c.regs.insert(0x35, 0xE0)
+    test.assert(lis2dw12.activity_config(d, true, true, 5))
+    test.assert_eq(reg_of(c, 0x34), 0xCA)
+    test.assert_eq(reg_of(c, 0x35), 0xF5)
+    test.assert(lis2dw12.activity_config(d, false, false, 99))
+    test.assert_eq(reg_of(c, 0x34), 0x8A)
+    test.assert_eq(reg_of(c, 0x35), 0xEF)
+
+@tier(app)
+fn tap(thr: Int) -> TapConfig
+    TapConfig { thr_x: thr,
+        thr_y: thr + 1,
+        thr_z: thr + 2,
+        prior: 3,
+        x_en: true,
+        y_en: false,
+        z_en: true,
+        double_tap: true,
+        latency: 5,
+        quiet: 2,
+        shock: 1 }
+
+@test
+fn test_the_tap_config_writes_the_thresholds_the_axes_the_timing_and_the_double_bit() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x30, 0xE0)
+    c.regs.insert(0x34, 0x3F)
+    test.assert(lis2dw12.tap_config(d, tap(8)))
+    // X keeps its 4D and 6D bits; Y is the priority and the threshold; Z is
+    // the axis enables and the threshold; the timing; the double-tap bit.
+    test.assert_eq(reg_of(c, 0x30), 0xE8)
+    test.assert_eq(reg_of(c, 0x31), 0x69)
+    test.assert_eq(reg_of(c, 0x32), 0xAA)
+    test.assert_eq(reg_of(c, 0x33), 0x59)
+    test.assert_eq(reg_of(c, 0x34), 0xBF)
+    let single = TapConfig { thr_x: 40,
+        thr_y: -3,
+        thr_z: 7,
+        prior: 12,
+        x_en: false,
+        y_en: true,
+        z_en: false,
+        double_tap: false,
+        latency: 99,
+        quiet: 9,
+        shock: 9 }
+    test.assert(lis2dw12.tap_config(d, single))
+    test.assert_eq(reg_of(c, 0x30), 0xFF)
+    test.assert_eq(reg_of(c, 0x31), 0xE0)
+    test.assert_eq(reg_of(c, 0x32), 0x47)
+    test.assert_eq(reg_of(c, 0x33), 0xFF)
+    test.assert_eq(reg_of(c, 0x34), 0x3F)
+
+@test
+fn test_the_tap_config_stops_at_the_first_register_the_part_refuses() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.ro.insert(0x32, 1)
+    test.assert(not lis2dw12.tap_config(d, tap(8)))
+    test.assert_eq(reg_of(c, 0x33), 0)
+
+@test
+fn test_the_free_fall_thresholds_are_the_data_sheet_s_table() [io, hw]
+    test.assert_eq(lis2dw12.free_fall_lsb(0), 5)
+    test.assert_eq(lis2dw12.free_fall_lsb(1), 7)
+    test.assert_eq(lis2dw12.free_fall_lsb(2), 8)
+    test.assert_eq(lis2dw12.free_fall_lsb(3), 10)
+    test.assert_eq(lis2dw12.free_fall_lsb(4), 11)
+    test.assert_eq(lis2dw12.free_fall_lsb(5), 13)
+    test.assert_eq(lis2dw12.free_fall_lsb(6), 15)
+    test.assert_eq(lis2dw12.free_fall_lsb(7), 16)
+    test.assert_eq(lis2dw12.free_fall_lsb(9), 16)
+    test.assert_eq(lis2dw12.free_fall_lsb(-1), 5)
+
+@test
+fn test_the_free_fall_duration_is_six_bits_over_two_registers() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x35, 0x7F)
+    test.assert(lis2dw12.free_fall_config(d, 3, 5))
+    test.assert_eq(reg_of(c, 0x36), 0x2B)
+    test.assert_eq(reg_of(c, 0x35), 0x7F)
+    test.assert(lis2dw12.free_fall_config(d, 9, 63))
+    test.assert_eq(reg_of(c, 0x36), 0xFF)
+    test.assert_eq(reg_of(c, 0x35), 0xFF)
+    test.assert(lis2dw12.free_fall_config(d, 0, 0))
+    test.assert_eq(reg_of(c, 0x36), 0x00)
+    test.assert_eq(reg_of(c, 0x35), 0x7F)
+
+@test
+fn test_the_orientation_config_sets_4d_and_the_angle_keeping_the_tap_threshold() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x30, 0x0B)
+    test.assert(lis2dw12.orientation_config(d, true, 2))
+    test.assert_eq(reg_of(c, 0x30), 0xCB)
+    test.assert(lis2dw12.orientation_config(d, false, 9))
+    test.assert_eq(reg_of(c, 0x30), 0x6B)
+
+@test
+fn test_the_source_registers_are_read_whole() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x39, 0x66)
+    c.regs.insert(0x38, 0x17)
+    c.regs.insert(0x3A, 0x42)
+    c.regs.insert(0x3B, 0x2D)
+    test.assert_eq(lis2dw12.tap_source(d), 0x66)
+    test.assert_eq(lis2dw12.wake_up_source(d), 0x17)
+    test.assert_eq(lis2dw12.orientation_source(d), 0x42)
+    test.assert_eq(lis2dw12.event_source(d), 0x2D)
+    c.st.insert(4, 0)
+    test.assert_eq(lis2dw12.tap_source(d), 0)
+    test.assert_eq(lis2dw12.event_source(d), 0)
+
+// ── Bring-up ─────────────────────────────────────────────────────────
+
+@test
+fn test_the_bring_up_resets_the_part_then_writes_its_settings_with_ctrl1_last() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x20, 0xFF)
+    c.regs.insert(0x25, 0xFF)
+    test.assert(d.setup())
+    test.assert(lis2dw12.start(d))
+    // The soft reset, then CTRL2 (BDU and the increment), CTRL3, INT1 on
+    // data-ready, INT2 off, CTRL6, CTRL7, the FIFO in bypass, and last CTRL1:
+    // 100 Hz, High-Performance Mode.
+    writes_are(c, [0x21,
+        0x40,
+        0x21,
+        0x0C,
+        0x22,
+        0x00,
+        0x23,
+        0x01,
+        0x24,
+        0x00,
+        0x25,
+        0x00,
+        0x3F,
+        0x00,
+        0x2E,
+        0x00,
+        0x20,
+        0x54])
+    test.assert_eq(reg_of(c, 0x20), 0x54)
+    test.assert_eq(reg_of(c, 0x25), 0x00)
+
+@test
+fn test_the_bring_up_over_spi_runs_the_same_settings() [io, hw]
+    let c = chip()
+    let d = spi_dut(c)
+    test.assert(lis2dw12.start(d))
+    writes_are(c, [0x21,
+        0x40,
+        0x21,
+        0x0C,
+        0x22,
+        0x00,
+        0x23,
+        0x01,
+        0x24,
+        0x00,
+        0x25,
+        0x00,
+        0x3F,
+        0x00,
+        0x2E,
+        0x00,
+        0x20,
+        0x54])
+
+@test
+fn test_the_bring_up_waits_for_the_reset_bit_to_clear_by_polling_it() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.st.insert(41, 5)
+    test.assert(lis2dw12.start(d))
+    test.assert_eq(reg_of(c, 0x20), 0x54)
+
+@test
+fn test_a_reset_bit_that_never_clears_ends_the_bring_up() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.st.insert(41, -1)
+    test.assert(not lis2dw12.start(d))
+    test.assert(not lis2dw12.soft_reset(d))
+    test.assert_eq(reg_of(c, 0x20), 0x00)
+
+@test
+fn test_a_part_that_is_not_a_lis2dw12_is_refused() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x0F, 0x33)
+    test.assert(not lis2dw12.start(d))
+    test.assert_eq(at(c.st, 80), 0)
+    let c2 = chip()
+    c2.st.insert(4, 0)
+    test.assert(not lis2dw12.start(i2c_dut(c2)))
+    test.assert(not lis2dw12.start(spi_dut(c2)))
+
+@test
+fn test_a_wiring_the_bus_cannot_use_is_refused_before_anything_is_sent() [io, hw]
+    let c = chip()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    test.assert(not lis2dw12.start(I2cDut { bus: FakeI2c { c: c }, pins: pins(c), w: w }))
+    log_is(c, [])
+
+@test
+fn test_a_part_that_refuses_a_setting_ends_the_bring_up() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.ro.insert(0x20, 1)
+    test.assert(not lis2dw12.start(d))
+    let c2 = chip()
+    c2.ro.insert(0x23, 1)
+    test.assert(not lis2dw12.start(i2c_dut(c2)))
+    // A part that dies right after the reset.
+    let c3 = chip()
+    c3.st.insert(70, 3)
+    test.assert(not lis2dw12.start(i2c_dut(c3)))
+    let c4 = chip()
+    c4.st.insert(70, 1)
+    test.assert(not lis2dw12.start(i2c_dut(c4)))
+
+@test
+fn test_the_reboot_sets_boot_keeping_the_other_bits_and_waits_for_it_to_clear() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    c.regs.insert(0x21, 0x0C)
+    c.st.insert(41, 3)
+    test.assert(lis2dw12.reboot(d))
+    writes_are(c, [0x21, 0x8C])
+    test.assert_eq(reg_of(c, 0x21), 0x0C)
+    c.st.insert(41, -1)
+    test.assert(not lis2dw12.reboot(d))
+    c.st.insert(4, 0)
+    test.assert(not lis2dw12.reboot(d))
+    let c2 = chip()
+    c2.st.insert(70, 1)
+    test.assert(not lis2dw12.reboot(i2c_dut(c2)))
+
+// ── The two types ────────────────────────────────────────────────────
+//
+// The types are built over the host's board handles, which answer as absent
+// hardware here: each method answers its "no part" value.  This runs the
+// lines of the two types that forward to the functions above.
+
+@test
+fn test_the_i2c_type_over_absent_hardware() [io, hw]
+    let w = dev_bus.wiring_i2c(0, 0x18)
+    let p = Lis2dw12.attach(BoardI2c { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0F) == None)
+    test.assert(not p.set_reg(0x20, 1))
+    test.assert(p.mode() == Lis2dwMode.Lis2dwLowPower)
+    test.assert_eq(p.lp_level(), 1)
+    test.assert_eq(p.resolution(), 12)
+    test.assert(not p.set_mode(Lis2dwMode.Lis2dwHighPerf, 1))
+    test.assert(not p.fifo_begin(10))
+    test.assert(not p.fifo_end())
+    test.assert(p.convert() == None)
+    test.assert(p.self_test(false) == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange.AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange.AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(p.accel_fifo_read(var out), 0)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
+
+@test
+fn test_the_spi_type_over_absent_hardware() [io, hw]
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    let p = Lis2dw12Spi.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, w)
+    test.assert(not p.begin())
+    test.assert(p.reg(0x0F) == None)
+    test.assert(not p.set_reg(0x20, 1))
+    test.assert(p.mode() == Lis2dwMode.Lis2dwLowPower)
+    test.assert_eq(p.lp_level(), 1)
+    test.assert_eq(p.resolution(), 12)
+    test.assert(not p.set_mode(Lis2dwMode.Lis2dwHighPerf, 1))
+    test.assert(not p.fifo_begin(10))
+    test.assert(not p.fifo_end())
+    test.assert(p.convert() == None)
+    test.assert(p.self_test(true) == None)
+    test.assert_eq(p.irq_level(), -1)
+    test.assert(p.accel_read() == None)
+    test.assert(not p.accel_ready())
+    test.assert(p.accel_range() == AccelRange.AccelRange2g)
+    test.assert(not p.accel_set_range(AccelRange.AccelRange4g))
+    test.assert_eq(p.accel_rate_hz(), 0)
+    test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_fifo_count(), 0)
+    var out: Vec[AccelMilliG; 32] = Vec.new()
+    test.assert_eq(p.accel_fifo_read(var out), 0)
+    test.assert_eq(p.temp_start(), -1)
+    test.assert(p.temp_read() == None)
+    test.assert(p.device_id() == None)
