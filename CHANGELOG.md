@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
+are path dependencies until they are published.
+
+- `Accelerometer.accel_rate_mhz` and `accel_set_rate_mhz` state the rates in
+  thousandths of a hertz, so the low-power modes' 1.6 Hz and the 12.5 Hz that a
+  whole-hertz request rounds up from are reachable through the trait. The
+  module gains `odr_for_rate_mhz` and `rate_write_mhz`; `accel_rate_hz` and
+  `accel_set_rate_hz` are unchanged.
+- `Accelerometer.accel_mode` and `accel_set_mode` take `AccelMode`:
+  `AccelLowPower` is Low-Power Mode 1 with the low-noise setting off,
+  `AccelNormal` is High-Performance Mode with it off, and `AccelHighResolution`
+  is High-Performance Mode with it on. `accel_mode` reads the single-conversion
+  mode as `AccelLowPower`. The inherent `mode`, `lp_level`, `resolution` and
+  `set_mode` stay.
+- `Accelerometer.accel_start` starts one conversion on demand and answers its
+  length in microseconds, or -1: the part is armed for the single-conversion
+  mode when it is not in it, and stays in that mode after the conversion. The
+  inherent `convert` stays, for a part that is armed already.
+- `Thermometer.temp_offset_error_milli_c` answers 15000, the offset of Table 5.
+
 ## 0.1.0
 
 The first release: a driver for ST's LIS2DW12 three-axis accelerometer on an

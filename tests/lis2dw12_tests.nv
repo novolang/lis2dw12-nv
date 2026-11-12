@@ -15,7 +15,7 @@
 use std.test
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, TimerAsync, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_accel.{ AccelMilliG, AccelRange, AccelMode, Accelerometer }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 use lis2dw12
@@ -885,6 +885,38 @@ fn test_the_rate_is_written_keeping_the_mode_and_the_low_power_level() [io, hw]
     test.assert_eq(reg_of(c, 0x20), 0x20)
 
 @test
+fn test_a_requested_rate_in_millihertz_reaches_1_6_and_12_5_hz() [io, hw]
+    // The low-power modes have 1.6 Hz as code 1, which a whole hertz rounds
+    // up from; both modes have 12.5 Hz as code 2.
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(1, false), 1)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(1600, false), 1)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(1601, false), 2)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(1600, true), 2)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(12500, false), 2)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(12500, true), 2)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(12501, true), 3)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(100000, true), 5)
+    test.assert_eq(lis2dw12.odr_for_rate_mhz(100001, false), 6)
+    let c = chip()
+    let d = i2c_dut(c)
+    // A low-power mode at level 4: 1.6 Hz is code 1.
+    c.regs.insert(0x20, 0x53)
+    test.assert_eq(lis2dw12.rate_write_mhz(d, 1600), 1600)
+    test.assert_eq(reg_of(c, 0x20), 0x13)
+    test.assert_eq(lis2dw12.rate_write_mhz(d, 12500), 12500)
+    test.assert_eq(reg_of(c, 0x20), 0x23)
+    // The whole-hertz form rounds a request of 2 Hz up to 12.5 Hz, and the
+    // rate read in millihertz is exact.
+    test.assert_eq(lis2dw12.rate_write(d, 2), 12500)
+    test.assert_eq(lis2dw12.rate_mhz_read(d), 12500)
+    // High-Performance Mode has no 1.6 Hz: the slowest rate is 12.5 Hz.
+    c.regs.insert(0x20, 0x57)
+    test.assert_eq(lis2dw12.rate_write_mhz(d, 1600), 12500)
+    test.assert_eq(reg_of(c, 0x20), 0x27)
+    c.st.insert(4, 0)
+    test.assert_eq(lis2dw12.rate_write_mhz(d, 12500), 0)
+
+@test
 fn test_a_rate_on_a_silent_or_stubborn_part_is_zero() [io, hw]
     let c = chip()
     let d = i2c_dut(c)
@@ -917,6 +949,50 @@ fn test_the_mode_and_the_level_are_written_keeping_the_rate() [io, hw]
     test.assert(lis2dw12.mode_write(d, Lis2dwMode.Lis2dwOnDemand, 0))
     test.assert_eq(reg_of(c, 0x20), 0x58)
     test.assert(lis2dw12.mode_read(d) == Lis2dwMode.Lis2dwOnDemand)
+
+@test
+fn test_the_trait_modes_are_low_power_normal_and_high_resolution() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // High-Performance Mode at level 4 with the low-noise setting off is
+    // normal; with it on, high resolution.
+    c.regs.insert(0x20, 0x57)
+    c.regs.insert(0x25, 0x10)
+    test.assert(lis2dw12.accel_mode_of(d) == Some(AccelMode.AccelNormal))
+    c.regs.insert(0x25, 0x14)
+    test.assert(lis2dw12.accel_mode_of(d) == Some(AccelMode.AccelHighResolution))
+    // A low-power mode and the single-conversion mode are low power.
+    c.regs.insert(0x20, 0x53)
+    test.assert(lis2dw12.accel_mode_of(d) == Some(AccelMode.AccelLowPower))
+    c.regs.insert(0x20, 0x5B)
+    test.assert(lis2dw12.accel_mode_of(d) == Some(AccelMode.AccelLowPower))
+    // Low power is Low-Power Mode 1 with the low-noise setting off, and the
+    // rate code stays.
+    test.assert(lis2dw12.accel_mode_set(d, AccelMode.AccelLowPower))
+    test.assert_eq(reg_of(c, 0x20), 0x50)
+    test.assert_eq(reg_of(c, 0x25), 0x10)
+    // Normal is High-Performance Mode with it off; high resolution with it
+    // on; the low-power level bits stay.
+    c.regs.insert(0x20, 0x53)
+    test.assert(lis2dw12.accel_mode_set(d, AccelMode.AccelNormal))
+    test.assert_eq(reg_of(c, 0x20), 0x57)
+    test.assert_eq(reg_of(c, 0x25), 0x10)
+    test.assert(lis2dw12.accel_mode_set(d, AccelMode.AccelHighResolution))
+    test.assert_eq(reg_of(c, 0x20), 0x57)
+    test.assert_eq(reg_of(c, 0x25), 0x14)
+    test.assert(lis2dw12.accel_mode_of(d) == Some(AccelMode.AccelHighResolution))
+    // A part that does not answer has no mode and takes none.
+    c.st.insert(4, 0)
+    test.assert(lis2dw12.accel_mode_of(d) == None)
+    test.assert(not lis2dw12.accel_mode_set(d, AccelMode.AccelLowPower))
+    test.assert(not lis2dw12.accel_mode_set(d, AccelMode.AccelNormal))
+    test.assert(not lis2dw12.accel_mode_set(d, AccelMode.AccelHighResolution))
+    // The mode takes, and the low-noise setting is refused.
+    let e = chip()
+    e.regs.insert(0x20, 0x53)
+    e.ro.insert(0x25, 1)
+    test.assert(not lis2dw12.accel_mode_set(i2c_dut(e), AccelMode.AccelHighResolution))
+    test.assert_eq(reg_of(e, 0x20), 0x57)
 
 @test
 fn test_low_noise_is_a_bit_of_ctrl6_and_leaves_ctrl1_alone() [io, hw]
@@ -1090,6 +1166,66 @@ fn test_arming_a_conversion_selects_the_software_trigger_and_the_mode_keeping_th
     test.assert_eq(reg_of(c, 0x20), 0x2B)
     c.st.insert(4, 0)
     test.assert(not lis2dw12.single_arm(d))
+
+@test
+fn test_a_conversion_is_started_and_its_length_is_the_turn_on_time_of_the_level() [io, hw]
+    let c = chip()
+    let d = i2c_dut(c)
+    // A part in High-Performance Mode is armed first: the single-conversion
+    // mode at the 12.5 Hz code with the level kept, then the trigger.
+    c.regs.insert(0x20, 0x57)
+    test.assert_eq(lis2dw12.single_start(d), 3550)
+    test.assert_eq(reg_of(c, 0x20), 0x2B)
+    test.assert_eq(reg_of(c, 0x22) & 0x02, 0x02)
+    // A part already in the mode is triggered and not armed again.
+    c.regs.insert(0x20, 0x58)
+    c.st.insert(80, 0)
+    test.assert_eq(lis2dw12.single_start(d), 1200)
+    test.assert_eq(reg_of(c, 0x20), 0x58)
+    writes_are(c, [0x22, 0x03])
+    c.regs.insert(0x20, 0x59)
+    test.assert_eq(lis2dw12.single_start(d), 1700)
+    c.regs.insert(0x20, 0x5A)
+    test.assert_eq(lis2dw12.single_start(d), 2300)
+    // The part refuses the arming, and does not answer.
+    let e = chip()
+    e.regs.insert(0x20, 0x57)
+    e.ro.insert(0x20, 1)
+    test.assert_eq(lis2dw12.single_start(i2c_dut(e)), -1)
+    c.st.insert(4, 0)
+    test.assert_eq(lis2dw12.single_start(d), -1)
+
+// A port whose reads of CTRL3 fail, over the double of the part.
+struct NoCtrl3
+    inner: I2cDut
+
+impl Lis2dw12Port for NoCtrl3
+    @tier(app)
+    fn setup(self) -> Bool [hw]
+        self.inner.setup()
+
+    @tier(app)
+    fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+        if reg == 0x22
+            dst.clear()
+            return false
+        self.inner.read_regs(reg, n, var dst)
+
+    @tier(app)
+    fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+        self.inner.write_reg(reg, v)
+
+    @tier(app)
+    fn irq_level(self) -> Int [hw]
+        self.inner.irq_level()
+
+@test
+fn test_a_trigger_that_is_not_acknowledged_ends_a_started_conversion() [io, hw]
+    // The part is in the single-conversion mode already, and the read of
+    // CTRL3 that the trigger starts with fails.
+    let c = chip()
+    c.regs.insert(0x20, 0x58)
+    test.assert_eq(lis2dw12.single_start(NoCtrl3 { inner: i2c_dut(c) }), -1)
 
 @test
 fn test_a_trigger_sets_sel_and_start_without_a_read_back_and_a_conversion_clears_it() [io, hw]
@@ -1678,11 +1814,17 @@ fn test_the_i2c_type_over_absent_hardware() [io, hw]
     test.assert(not p.accel_set_range(AccelRange.AccelRange4g))
     test.assert_eq(p.accel_rate_hz(), 0)
     test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_rate_mhz(), 0)
+    test.assert_eq(p.accel_set_rate_mhz(1600), 0)
+    test.assert(p.accel_mode() == None)
+    test.assert(not p.accel_set_mode(AccelMode.AccelNormal))
+    test.assert_eq(p.accel_start(), -1)
     test.assert_eq(p.accel_fifo_count(), 0)
     var out: Vec[AccelMilliG; 32] = Vec.new()
     test.assert_eq(p.accel_fifo_read(var out), 0)
     test.assert_eq(p.temp_start(), -1)
     test.assert(p.temp_read() == None)
+    test.assert_eq(p.temp_offset_error_milli_c(), 15000)
     test.assert(p.device_id() == None)
 
 @test
@@ -1707,9 +1849,15 @@ fn test_the_spi_type_over_absent_hardware() [io, hw]
     test.assert(not p.accel_set_range(AccelRange.AccelRange4g))
     test.assert_eq(p.accel_rate_hz(), 0)
     test.assert_eq(p.accel_set_rate_hz(100), 0)
+    test.assert_eq(p.accel_rate_mhz(), 0)
+    test.assert_eq(p.accel_set_rate_mhz(1600), 0)
+    test.assert(p.accel_mode() == None)
+    test.assert(not p.accel_set_mode(AccelMode.AccelNormal))
+    test.assert_eq(p.accel_start(), -1)
     test.assert_eq(p.accel_fifo_count(), 0)
     var out: Vec[AccelMilliG; 32] = Vec.new()
     test.assert_eq(p.accel_fifo_read(var out), 0)
     test.assert_eq(p.temp_start(), -1)
     test.assert(p.temp_read() == None)
+    test.assert_eq(p.temp_offset_error_milli_c(), 15000)
     test.assert(p.device_id() == None)

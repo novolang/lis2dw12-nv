@@ -67,7 +67,7 @@
 
 use embedded_hal.{ BoardI2c, BoardSpi, BoardGpio, I2cBus, SpiBus, GpioOut, TimerAsync, AsyncEdge }
 use dev_bus.{ DeviceWiring, DevBytes }
-use dev_accel.{ AccelMilliG, AccelRange, Accelerometer }
+use dev_accel.{ AccelMilliG, AccelRange, AccelMode, Accelerometer }
 use dev_thermo.{ TempMilliC, Thermometer }
 use dev_id.{ DeviceId, Identifiable }
 
@@ -167,6 +167,9 @@ let SPI_MODE = 3
 let RESET_POLLS   = 100
 let SAMPLE_POLLS  = 4000
 let CONVERT_POLLS = 400
+
+// The die temperature's offset, ±15 °C (Table 5), in milli-degrees.
+let TEMP_OFFSET_MC = 15000
 
 // The self-test limits of Table 3 in milli-g, for the positive difference.
 let ST_MIN_MG = 70
@@ -424,7 +427,11 @@ fn rate_lp_mhz(odr: Int) -> Int
 // The ODR code of the slowest rate at or above `hz` in High-Performance Mode
 // when `hp`, or in the low-power modes, or of the fastest the mode has.
 pub fn odr_for_rate(hz: Int, hp: Bool) -> Int
-    let mhz = hz * 1000
+    odr_for_rate_mhz(hz * 1000, hp)
+
+// The same for a rate in thousandths of a hertz, which reaches the low-power
+// modes' 1.6 Hz and the 12.5 Hz that whole hertz round up to 13.
+pub fn odr_for_rate_mhz(mhz: Int, hp: Bool) -> Int
     if not hp and mhz <= 1600
         return 1
     if mhz <= 12500
@@ -501,9 +508,13 @@ pub fn rate_mhz_read<P: Lis2dw12Port>(p: P) -> Int [hw]
 // down starts it.  In High-Performance Mode with the bandwidth at ODR/2 the
 // first sample at a rate of 100 Hz and up is to be discarded (Table 13).
 pub fn rate_write<P: Lis2dw12Port>(p: P, hz: Int) -> Int [hw]
+    rate_write_mhz(p, hz * 1000)
+
+// The same for a rate in thousandths of a hertz.
+pub fn rate_write_mhz<P: Lis2dw12Port>(p: P, mhz: Int) -> Int [hw]
     let Some(old) = reg_read(p, CTRL1) else return 0
     let hp = ((old >> 2) & 3) == MODE_HIGH_PERF
-    let v = (odr_for_rate(hz, hp) << 4) | (old & 0x0F)
+    let v = (odr_for_rate_mhz(mhz, hp) << 4) | (old & 0x0F)
     if not reg_write(p, CTRL1, v)
         return 0
     rate_mhz_of(v)
@@ -525,6 +536,35 @@ pub fn resolution_read<P: Lis2dw12Port>(p: P) -> Int [hw]
 // LP_MODE plus one; Level 1 gives 12 bits and the others 14.
 pub fn mode_write<P: Lis2dw12Port>(p: P, m: Lis2dwMode, lp_level: Int) -> Bool [hw]
     reg_update(p, CTRL1, CTRL1_MODE_MASK | CTRL1_LP_MASK, (mode_bits(m) << 2) | (clamp(lp_level, 1, 4) - 1))
+
+// The mode as `Accelerometer.accel_mode` states it, from the part's mode and
+// its low-noise setting: `AccelLowPower` for the low-power modes and the single-conversion
+// mode, `AccelNormal` for High-Performance Mode, which `start` sets, and
+// `AccelHighResolution` for High-Performance Mode with the low-noise setting
+// on, the finest the part resolves.  CTRL1 and CTRL6 are read in one
+// transaction.  `None` when the part did not answer.
+pub fn accel_mode_of<P: Lis2dw12Port>(p: P) -> ?AccelMode [hw]
+    var b: DevBytes = Vec.new()
+    if not p.read_regs(CTRL1, 6, var b)
+        return None
+    if mode_of_ctrl1(b[0] as Int) != Lis2dwHighPerf
+        return Some(AccelLowPower)
+    if (b[5] as Int & CTRL6_LOW_NOISE) != 0
+        return Some(AccelHighResolution)
+    Some(AccelNormal)
+
+// Puts the part in the mode `m` states and leaves the rate: whether the part
+// took it.  `AccelLowPower` is Low-Power Mode 1, the lowest current, with
+// the low-noise setting off; `AccelNormal` is High-Performance Mode with it
+// off; `AccelHighResolution` is High-Performance Mode with it on.  The rate
+// codes mean other rates in the two families (Table 29), so a rate above
+// 200 Hz changes with a move out of High-Performance Mode; set the rate
+// after the mode.
+pub fn accel_mode_set<P: Lis2dw12Port>(p: P, m: AccelMode) -> Bool [hw]
+    match m
+        AccelLowPower       => reg_update(p, CTRL1, CTRL1_MODE_MASK | CTRL1_LP_MASK, MODE_LOW_POWER << 2) and low_noise_write(p, false)
+        AccelNormal         => reg_update(p, CTRL1, CTRL1_MODE_MASK, MODE_HIGH_PERF << 2) and low_noise_write(p, false)
+        AccelHighResolution => reg_update(p, CTRL1, CTRL1_MODE_MASK, MODE_HIGH_PERF << 2) and low_noise_write(p, true)
 
 // Turns the low-noise setting on or off: whether the part took it.
 pub fn low_noise_write<P: Lis2dw12Port>(p: P, on: Bool) -> Bool [hw]
@@ -627,6 +667,23 @@ pub fn single_trigger<P: Lis2dw12Port>(p: P) -> Bool [hw]
 // Whether the last trigger's conversion has finished: SLP_MODE_1 is clear.
 pub fn single_done<P: Lis2dw12Port>(p: P) -> Bool [hw]
     ((reg_read(p, CTRL3) ?? CTRL3_SLP_1) & CTRL3_SLP_1) == 0
+
+// Starts one conversion on demand, for `Accelerometer.accel_start`: the part
+// is put in the single-conversion mode when it is not in it, the conversion
+// is triggered, and the time it takes is answered in microseconds, the
+// turn-on time of the low-power level the part has (§ 3.2.2).  -1 when the
+// part did not take it.  The part goes back to power-down when the
+// conversion is done and stays in the single-conversion mode; `accel_mode_set`
+// puts it back in a continuous one.  The program waits the time and reads
+// the sample.
+pub fn single_start<P: Lis2dw12Port>(p: P) -> Int [hw]
+    let Some(c1) = reg_read(p, CTRL1) else return -1
+    if ((c1 >> 2) & 3) != MODE_ON_DEMAND
+        if not single_arm(p)
+            return -1
+    if not single_trigger(p)
+        return -1
+    t_on_us(lp_level_of_ctrl1(c1))
 
 // One conversion on demand: triggers it, polls until it has finished, and
 // answers the sample, or `None` when the trigger was not acknowledged or the
@@ -1013,6 +1070,24 @@ impl Accelerometer[hw] for Lis2dw12
     fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
         rate_write(self, hz) / 1000
 
+    // The rates in thousandths of a hertz, which state the low-power modes'
+    // 1.6 Hz and the 12.5 Hz exactly.
+    fn accel_rate_mhz(self) -> Int [hw]
+        rate_mhz_read(self)
+
+    fn accel_set_rate_mhz(self, mhz: Int) -> Int [hw]
+        rate_write_mhz(self, mhz)
+
+    fn accel_mode(self) -> ?AccelMode [hw]
+        accel_mode_of(self)
+
+    fn accel_set_mode(self, m: AccelMode) -> Bool [hw]
+        accel_mode_set(self, m)
+
+    // One conversion on demand; the answer is its length in microseconds.
+    fn accel_start(self) -> Int [hw]
+        single_start(self)
+
     fn accel_fifo_count(self) -> Int [hw]
         fifo_count(self)
 
@@ -1025,6 +1100,11 @@ impl Thermometer[hw] for Lis2dw12
 
     fn temp_read(self) -> ?TempMilliC [hw]
         temp_read_milli_c(self)
+
+    // The reading is 25 degrees plus the count with an offset of ±15 degrees
+    // (Table 5).
+    fn temp_offset_error_milli_c(self) -> Int [hw]
+        TEMP_OFFSET_MC
 
 impl Identifiable[hw] for Lis2dw12
     // WHO_AM_I, 0x44; the part keeps no revision register, so `rev` is
@@ -1124,6 +1204,24 @@ impl Accelerometer[hw] for Lis2dw12Spi
     fn accel_set_rate_hz(self, hz: Int) -> Int [hw]
         rate_write(self, hz) / 1000
 
+    // The rates in thousandths of a hertz, which state the low-power modes'
+    // 1.6 Hz and the 12.5 Hz exactly.
+    fn accel_rate_mhz(self) -> Int [hw]
+        rate_mhz_read(self)
+
+    fn accel_set_rate_mhz(self, mhz: Int) -> Int [hw]
+        rate_write_mhz(self, mhz)
+
+    fn accel_mode(self) -> ?AccelMode [hw]
+        accel_mode_of(self)
+
+    fn accel_set_mode(self, m: AccelMode) -> Bool [hw]
+        accel_mode_set(self, m)
+
+    // One conversion on demand; the answer is its length in microseconds.
+    fn accel_start(self) -> Int [hw]
+        single_start(self)
+
     fn accel_fifo_count(self) -> Int [hw]
         fifo_count(self)
 
@@ -1136,6 +1234,11 @@ impl Thermometer[hw] for Lis2dw12Spi
 
     fn temp_read(self) -> ?TempMilliC [hw]
         temp_read_milli_c(self)
+
+    // The reading is 25 degrees plus the count with an offset of ±15 degrees
+    // (Table 5).
+    fn temp_offset_error_milli_c(self) -> Int [hw]
+        TEMP_OFFSET_MC
 
 impl Identifiable[hw] for Lis2dw12Spi
     // WHO_AM_I, 0x44; the part keeps no revision register, so `rev` is

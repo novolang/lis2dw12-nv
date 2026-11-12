@@ -147,7 +147,8 @@ Code 0 is power-down.  A new sample sets DRDY in STATUS.  The part can drive
 the same event onto its INT1 pin (CTRL4_INT1_PAD_CTRL, INT1_DRDY), and the
 driver turns that on.  The die temperature is in OUT_T_L and OUT_T_H as a
 12-bit word, 16 counts to the degree, 0 at 25 °C with an offset of ±15 °C
-(Table 5), so it shows change and not an absolute temperature.
+(Table 5), so it shows change and not an absolute temperature;
+`temp_offset_error_milli_c()` answers the 15000 milli-degrees.
 
 The part has two bus interfaces on the same pins.  CS high selects I2C.
 
@@ -182,12 +183,15 @@ the wiring, as a board's device table builds it.  Both implement
 | `accel_read()`, `accel_ready()`, `accel_read_new()` | `Accelerometer`: the latest sample in milli-g, the data-ready flag, a sample not read before |
 | `accel_range()`, `accel_set_range(r)` | the full scale, changed without touching the other bits of CTRL6 |
 | `accel_rate_hz()`, `accel_set_rate_hz(hz)` | the rate in whole hertz (1.6 Hz reads 1, 12.5 Hz reads 12), and the slowest rate at or above `hz` in the present mode |
+| `accel_rate_mhz()`, `accel_set_rate_mhz(mhz)` | the same in thousandths of a hertz, which states 1.6 Hz (1600) and 12.5 Hz (12500) exactly |
+| `accel_mode()`, `accel_set_mode(m)` | `AccelLowPower` is Low-Power Mode 1 (and the single-conversion mode reads as it), `AccelNormal` is High-Performance Mode, `AccelHighResolution` is High-Performance Mode with the low-noise setting on; the rate is left, and the rate codes mean other rates in the two families, so set the rate after the mode |
+| `accel_start()` | one conversion on demand: arms the single-conversion mode when the part is not in it, triggers the conversion and answers its length in microseconds (1200, 1700, 2300 or 3550 by the low-power level), or -1; read the sample after that time, and `accel_set_mode` puts the part back in a continuous mode |
 | `accel_fifo_count()`, `accel_fifo_read(dst)` | the FIFO, which is off until `fifo_begin` |
-| `temp_start()`, `temp_read()` | `Thermometer`: the part converts at its sample rate, so a start answers 0, or -1 when the part is in power-down |
+| `temp_start()`, `temp_read()`, `temp_offset_error_milli_c()` | `Thermometer`: the part converts at its sample rate, so a start answers 0, or -1 when the part is in power-down; the offset is 15000 milli-degrees |
 | `device_id()` | `Identifiable`: WHO_AM_I, 0x44 |
 | `mode()`, `lp_level()`, `resolution()`, `set_mode(m, level)` | the mode, the low-power level 1 to 4, the width in bits, and the change of mode and level that leaves the rate |
 | `fifo_begin(n)`, `fifo_end()` | turn the FIFO on in continuous mode with the threshold at `n` samples, and off |
-| `convert()` | one conversion on demand: triggers it, polls until it ends, answers the sample |
+| `convert()` | one conversion on demand with the part armed: triggers it, polls until it ends, answers the sample |
 | `self_test(negative)` | the change in milli-g that the part's self-test makes |
 | `reg(r)`, `set_reg(r, v)` | one register, and a write that is read back |
 
@@ -242,12 +246,14 @@ of the wiring through any `AsyncEdge` source.  No board's GPIO implements
    is to be discarded (Table 13), and so is the first sample after a switch
    into or out of the FIFO (section 5.3).
 3. `accel_set_rate_hz` answers the rate taken, which is rarely the rate asked
-   for, and in whole hertz.  `rate_write` answers millihertz.  The low-power
-   modes stop at 200 Hz; a request above it takes code 6.
+   for, and in whole hertz.  `accel_set_rate_mhz` and `rate_write` answer
+   millihertz.  The low-power modes stop at 200 Hz; a request above it takes
+   code 6.
 4. With the FIFO on, a read of OUT_X_L takes the oldest sample out of the
    FIFO.  `accel_read` therefore takes a sample from the FIFO while it is on,
    and the FIFO's count falls by one.
-5. A conversion on demand needs `single_arm` first: the part goes to the
+5. A conversion on demand needs the part armed: `accel_start` does it
+   (`single_arm`), and `convert` assumes it. The part goes to the
    single-conversion mode with the software trigger selected.  See the open
    question below.
 6. The self-test change is the second reading minus the first, with the part
@@ -290,6 +296,22 @@ VERIFIED until the part is on a bench.
   LIS2DTW12 and IIS2DLPC.  This driver is for the LIS2DW12.
 - A part with the address pin wired to neither the supply nor ground: SA0
   selects 0x18 or 0x19, and the wiring record carries the one the board uses.
+
+## Where the traits fall short
+
+- `AccelerometerAsync` and `ThermometerAsync` are not implemented: a `@value`
+  driver cannot implement an `async fn` trait, and `async fn` is refused at
+  the embedded tier.  The free functions `accel_measure` and `accel_next`
+  stand in for them on a host's scheduler.
+- `AsyncDeviceReady` has no source, because `BoardGpio` has no `AsyncEdge`;
+  `irq_arm` and `irq_disarm` take the edge source as an argument.
+- A trait method gets a plain `self`, so the driver keeps no state between
+  calls.
+- The package `[tier]` applies to `tests/` too, so the test doubles carry
+  `@tier(app)`.
+- `Accelerometer.accel_mode` has three values for the part's family of modes,
+  and the part has more: the low-power level 1 to 4, which `set_mode` and
+  `lp_level` still set and read.
 
 ## Related packages
 
