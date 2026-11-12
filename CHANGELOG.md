@@ -1,9 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-11-12
 
-Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0, which
-are path dependencies until they are published.
+Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0. The release depends on both.
 
 - `Accelerometer.accel_rate_mhz` and `accel_set_rate_mhz` state the rates in
   thousandths of a hertz, so the low-power modes' 1.6 Hz and the 12.5 Hz that a

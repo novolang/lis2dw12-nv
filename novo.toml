@@ -1,6 +1,6 @@
 [package]
 name        = "lis2dw12-nv"
-version     = "0.1.0"
+version     = "0.1.1"
 description = "A driver for ST's LIS2DW12 three-axis accelerometer on an I2C or an SPI bus: the acceleration in milli-g at 12 or 14 bits by mode, the four full scales, the high-performance and the four low-power modes, the rates, the single conversion on demand, the data-ready line, the FIFO as an option, the wake-up, tap, free-fall and orientation detectors as configuration with their interrupt routing, the die temperature, the self-test and WHO_AM_I, as devices-nv's Accelerometer, Thermometer and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
