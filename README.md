@@ -167,7 +167,7 @@ program that clears it makes a burst read return one register repeatedly.
 
 | Module | What is in it |
 |---|---|
-| `lis2dw12` | The types `Lis2dw12` (I2C) and `Lis2dw12Spi` (SPI), `Lis2dwMode`, `TapConfig`, the trait `Lis2dw12Port`, the bus framing, the register access, the conversions, the FIFO, the conversion on demand, the detectors, the self-test, the awaiting functions and the bring-up |
+| `lis2dw12` | The types `Lis2dw12` (I2C) and `Lis2dw12Spi` (SPI), `Lis2dwMode`, `TapConfig`, the trait `Lis2dw12Port` over devices-nv's `RegPort`, the bus framing, the conversions, the FIFO, the conversion on demand, the detectors, the self-test, the awaiting functions and the bring-up |
 
 ## How to choose an entry point
 
@@ -212,10 +212,14 @@ module that take the port, so they work for both types:
 | `soft_reset(p)`, `reboot(p)`, `low_noise_write(p, on)`, `bandwidth_write(p, code)` | the soft reset, the reload of the trimming from non-volatile memory, the low-noise setting and the filter bandwidth |
 
 A program that holds its own bus, or a test with a double of the part,
-implements `Lis2dw12Port` over its bus and calls the module's functions, which
-take the port: `lis2dw12.sample_read(port)`, `lis2dw12.start(port)`.  The
-framing of each bus is `i2c_read_into`, `i2c_write`, `spi_read_into` and
-`spi_write`, generic over `I2cBus` and `SpiBus`.
+implements devices-nv's `RegPort` (`read_regs` and `write_reg`) and
+`Lis2dw12Port` (`setup` and `irq_level`) over its bus, and calls the module's
+functions, which take the port: `lis2dw12.sample_read(port)`,
+`lis2dw12.start(port)`.  The register reads and read-modify-writes are the
+methods of `RegPort`, `port.read_reg(reg)` and
+`port.update_reg_verified(reg, mask, bits)`.  The framing of each bus is
+`i2c_read_into`, `i2c_write`, `spi_read_into` and `spi_write`, generic over
+`I2cBus` and `SpiBus`.
 
 ### Waiting for a sample
 

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.0 — 2026-11-24
+
+The register reads and writes, and the bus set-up, are devices-nv's `RegPort` and `wiring_*` functions, and `Lis2dw12Port` is smaller by them.  The release depends on devices-nv 0.4.1.
+
+### Breaking
+
+- **`Lis2dw12Port` has the supertrait `RegPort` and no longer declares `read_regs` and `write_reg`.**  A type that implements `Lis2dw12Port` for a bus of its own moves those two methods, unchanged, into an `impl RegPort`.  *Migration:* with `use dev_bus.{ RegPort }`,
+
+  ```novo
+  impl RegPort for MyPort
+      fn read_regs(self, reg: Int, n: Int, var dst: DevBytes) -> Bool [hw]
+          ...
+      fn write_reg(self, reg: Int, v: Int) -> Bool [hw]
+          ...
+
+  impl Lis2dw12Port for MyPort
+      ...                      // the other methods stay where they are
+  ```
+
+  The package's own types are migrated.  A caller that holds one of them is unaffected.
+
+### Deprecated
+
+- `reg_read`, `reg_write`, `reg_update`, `i2c_setup`, `spi_setup`, `irq_level_of`: each is a one-line function over the method or the `wiring_*` function that replaces it, warns W1001 at a call with the replacement named, and is removed in the next release.  `Lis2dw12Port` itself is the driver's trait and stays.
+
+### Changed
+
+- The register helpers the module carried (`reg_read`, `reg_write`, `reg_update` over its port) are devices-nv's `RegPort` methods (`read_reg`, `write_reg_verified`, `update_reg_verified` and the others); the module calls them as `p.read_reg(reg)`.
+- Both bus types are set up by `dev_bus.wiring_i2c_setup` and `wiring_spi_setup` with the part's rate and mode, and read the interrupt line with `wiring_irq_level`.
+- Image size on nrf52840-dk, `.text` plus read-only data, before and after: 15,524 bytes before and after on the I2C read-out, 12,392 bytes before and after on an SPI read-out (nrf52-qemu: 8,400 and 11,688, equal).
+
 ## 0.1.1 — 2026-11-12
 
 Moves off its stand-ins onto devices-nv 0.4.0 and embedded-hal-nv 0.4.0. The release depends on both.
